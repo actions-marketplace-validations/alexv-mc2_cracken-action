@@ -33,6 +33,21 @@ printf '%s' '{"@context":"https://spdx.org/rdf/3.1.0/spdx-context.jsonld","@grap
 cp "$tmp/v2/image.spdx.json" "$tmp/mixed/"
 cp "$tmp/v3/image.rootfs.spdx.json" "$tmp/mixed/"
 pack 'SPDX 2 directory includes the document set' "$tmp/v2" "$tmp/v2.zip" 4
+sleep 3
+pack 'same SPDX input can be packed again' "$tmp/v2" "$tmp/v2-again.zip" 4
+python3 - "$tmp/v2.zip" "$tmp/v2-again.zip" <<'PY'
+import hashlib, pathlib, sys, zipfile
+first, second = (pathlib.Path(path) for path in sys.argv[1:])
+assert hashlib.sha256(first.read_bytes()).digest() == hashlib.sha256(second.read_bytes()).digest()
+with zipfile.ZipFile(first) as archive:
+    assert archive.namelist() == sorted(archive.namelist())
+    for entry in archive.infolist():
+        assert entry.date_time == (1980, 1, 1, 0, 0, 0)
+        assert entry.create_system == 3
+        assert entry.external_attr >> 16 == 0o100644
+        assert entry.compress_type == zipfile.ZIP_DEFLATED
+PY
+checks=$((checks+1)); echo "ok $checks - repeat packing has identical SHA-256 and fixed ZIP metadata"
 python3 - "$tmp/v2.zip" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as z:
@@ -63,6 +78,93 @@ refuse 'directory symlink outside input' "$tmp/outside" 'unsafe symlink in input
 cp "$tmp/v3/image.rootfs.spdx.json" "$tmp/two-roots/first.rootfs.spdx.json"
 cp "$tmp/v3/image.rootfs.spdx.json" "$tmp/two-roots/second.rootfs.spdx.json"
 refuse 'two different real rootfs files' "$tmp/two-roots" 'SPDX 3 requires exactly one complete *.rootfs.spdx.json'
+
+# Only the selected SPDX 3 root counts against the uncompressed upload limit.
+python3 - "$tmp" <<'PY'
+import json, pathlib, sys, tarfile
+root = pathlib.Path(sys.argv[1])
+url = 'https://spdx.org/rdf/3.0.1/spdx-context.jsonld'
+small = {'@context': url, '@graph': [{'type': 'CreationInfo', 'specVersion': '3.0.1'}]}
+large = dict(small, padding='x' * (16 * 1024 * 1024))
+unused = root / 'large-unused'
+unused.mkdir()
+(unused / 'image.rootfs.spdx.json').write_text(json.dumps(small))
+(unused / 'recipe.spdx.json').write_text(json.dumps(large))
+selected = root / 'large-selected'
+selected.mkdir()
+(selected / 'image.rootfs.spdx.json').write_text(json.dumps(large))
+with tarfile.open(root / 'large-unused.tar', 'w') as archive:
+    for path in sorted(unused.iterdir()):
+        archive.add(path, arcname=path.name)
+PY
+pack 'unused SPDX 3 documents over 16 MiB do not count' "$tmp/large-unused" "$tmp/large-unused.zip" 1
+python3 - "$tmp/large-unused.zip" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    assert archive.namelist() == ['image.rootfs.spdx.json']
+PY
+zstd -q "$tmp/large-unused.tar" -o "$tmp/large-unused.spdx.tar.zst"
+pack 'unused SPDX 3 documents in tar do not count' "$tmp/large-unused.spdx.tar.zst" "$tmp/large-unused-tar.zip" 1
+refuse 'selected SPDX 3 root over 16 MiB' "$tmp/large-selected" 'SPDX files exceed the 16 MiB uncompressed ZIP limit'
+
+# Grow a candidate deterministically after fstat and before the directory read.
+python3 - "$tmp" <<'PYGROW'
+import contextlib, io, os, pathlib, sys
+root = pathlib.Path(sys.argv[1]).resolve() / 'growing'
+root.mkdir()
+candidate = root / 'image.spdx.json'
+candidate.write_bytes(b'{"spdxVersion":"SPDX-2.2"}')
+output = root / 'output.zip'
+script = pathlib.Path('scripts/yocto-pack.sh').read_text().split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+original_fstat = os.fstat
+grew = False
+def growing_fstat(fd):
+    global grew
+    stat = original_fstat(fd)
+    if not grew:
+        grew = True
+        with candidate.open('ab') as stream:
+            stream.write(b' ')
+    return stat
+os.fstat = growing_fstat
+sys.argv = ['yocto-pack', str(root), str(output)]
+stderr = io.StringIO()
+try:
+    with contextlib.redirect_stderr(stderr):
+        exec(compile(script, 'yocto-pack.sh', 'exec'), {})
+except SystemExit as exc:
+    assert exc.code == 1, exc.code
+else:
+    raise AssertionError('growing SPDX candidate was accepted')
+assert grew
+assert stderr.getvalue().strip() == 'yocto-pack: SPDX candidate file changed while reading: ' + str(candidate)
+assert not output.exists()
+PYGROW
+checks=$((checks+1)); echo "ok $checks - candidate growth during read is refused"
+
+# Sparse candidate bodies keep the fixtures small on disk. The second file
+# crosses the read limit, while neither candidate crosses it on its own.
+python3 - "$tmp" <<'PY'
+import pathlib, sys, tarfile
+root = pathlib.Path(sys.argv[1])
+folder = root / 'read-limit'
+folder.mkdir()
+sizes = (64 * 1024 * 1024, 64 * 1024 * 1024 + 1)
+for index, size in enumerate(sizes):
+    with (folder / f'{index}.spdx.json').open('wb') as file:
+        file.truncate(size)
+with (root / 'read-limit.tar').open('wb') as file:
+    for index, size in enumerate(sizes):
+        member = tarfile.TarInfo(f'{index}.spdx.json')
+        member.size = size
+        file.write(member.tobuf())
+        file.seek((size + 511) // 512 * 512, 1)
+    file.write(b'\0' * 1024)
+PY
+read_limit_message='SPDX candidate files exceed the 128 MiB read limit; pass the image SPDX archive or a directory with only the image documents'
+refuse 'directory candidates exceed read limit' "$tmp/read-limit" "$read_limit_message"
+zstd -q "$tmp/read-limit.tar" -o "$tmp/read-limit.spdx.tar.zst"
+refuse 'archive candidates exceed read limit' "$tmp/read-limit.spdx.tar.zst" "$read_limit_message"
 
 python3 - "$tmp" <<'PY'
 import io, pathlib, sys, tarfile
@@ -97,6 +199,30 @@ with tarfile.open(sys.argv[2], 'w') as t:
 PYTAR
 zstd -q "$tmp/valid.tar" -o "$tmp/valid.spdx.tar.zst"
 pack 'compressed SPDX archive' "$tmp/valid.spdx.tar.zst" "$tmp/from-tar.zip" 4
+mkdir -p "$tmp/kirkstone" "$tmp/no-zstd-bin"
+cp "$tmp/valid.spdx.tar.zst" "$tmp/kirkstone/image.spdx.tar.zst"
+printf '%s' '{"index":[]}' > "$tmp/kirkstone/image.spdx.index.json"
+pack 'kirkstone directory uses its archive instead of the index' "$tmp/kirkstone" "$tmp/kirkstone.zip" 4
+python3 - "$tmp/from-tar.zip" "$tmp/kirkstone.zip" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as direct, zipfile.ZipFile(sys.argv[2]) as directory:
+    assert direct.namelist() == directory.namelist()
+    assert all(direct.read(name) == directory.read(name) for name in direct.namelist())
+PY
+ln -s "$(command -v python3)" "$tmp/no-zstd-bin/python3"
+if PATH="$tmp/no-zstd-bin" /bin/bash scripts/yocto-pack.sh "$tmp/kirkstone" "$tmp/no-zstd.zip" >"$tmp/log" 2>&1; then
+  echo 'FAIL: directory accepted without zstd'; exit 1
+fi
+grep -Fq 'pass the .spdx.tar.zst file' "$tmp/log"
+[[ ! -e "$tmp/no-zstd.zip" ]]
+checks=$((checks+1)); echo "ok $checks - missing zstd gives archive guidance"
+cp "$tmp/valid.spdx.tar.zst" "$tmp/kirkstone/other.spdx.tar.zst"
+refuse 'multiple archives' "$tmp/kirkstone" 'multiple .spdx.tar.zst candidates:'
+grep -Fq "$tmp/kirkstone/image.spdx.tar.zst" "$tmp/log"
+grep -Fq "$tmp/kirkstone/other.spdx.tar.zst" "$tmp/log"
+rm "$tmp/kirkstone/other.spdx.tar.zst" "$tmp/kirkstone/image.spdx.tar.zst"
+cp "$tmp/parent.spdx.tar.zst" "$tmp/kirkstone/unsafe.spdx.tar.zst"
+refuse 'directory archive retains traversal protection' "$tmp/kirkstone" 'unsafe archive path: ../escape.spdx.json'
 ln -s valid.spdx.tar.zst "$tmp/image.spdx.tar.zst"
 pack 'top-level archive symlink' "$tmp/image.spdx.tar.zst" "$tmp/from-link.zip" 4
 python3 - "$tmp/from-tar.zip" "$tmp/from-link.zip" <<'PY'
